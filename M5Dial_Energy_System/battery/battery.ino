@@ -5,8 +5,6 @@
 #include <ArduinoJson.h>
 
 // Let's Encrypt Root CA Certificate (ISRG Root X1)
-// Valid until 2035, used by Let's Encrypt
-// Downloaded from https://letsencrypt.org/certificates/
 const char* root_ca = \
 "-----BEGIN CERTIFICATE-----\n" \
 "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n" \
@@ -40,46 +38,67 @@ const char* root_ca = \
 "emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n" \
 "-----END CERTIFICATE-----\n";
 
-// Battery setting items
-enum BatterySettingItem {
-  BATTERY_CAPACITY = 0,
-  BATTERY_CHARGE_LIMIT,
-  BATTERY_DISCHARGE_LIMIT,
-  BATTERY_CONFIRM,
-  BATTERY_SETTING_COUNT
+// Page navigation
+enum PageType {
+  PAGE_CAPACITY,        // 第0頁（起始頁）：電池容量設定
+  PAGE_CHARGE_LIMIT,        // 第1頁：充電限制設定
+  PAGE_DISCHARGE_LIMIT,     // 第2頁：放電限制設定
+  PAGE_SERVER_DATA,         // 第3頁（最後一頁）：伺服器數據顯示
+  PAGE_COUNT
 };
 
 // Global variables
-int currentSettingIndex = 0;        // Current selected setting item
+int currentPage = PAGE_CAPACITY;                // Current page
 bool isEditing = false;             // Whether in editing mode
 long oldPosition = -999;            // Encoder position
+float editStartValue = 0;           // Value when editing started
+unsigned long lastButtonPress = 0;  // Debounce
+unsigned long lastRefreshTime = 0;  // Last server data refresh
+unsigned long lastPublishTime = 0;
 
-// Battery parameters
+// Battery parameters (push to server)
 float batteryCapacity = 100.0;      // kWh
 float batteryChargeLimit = 5.0;     // kW
 float batteryDischargeLimit = 5.0;  // kW
-float batterySOC = 85.0;            // % (from server)
+
+// Server data (received from server)
+float batterySOC = 0.0;             // % (from server)
 float batteryActualPower = 0.0;     // kW (from server)
+bool hasServerData = false;          // Whether we have received server data
+
+// Parameter ranges
+struct ParamRange {
+  float min;
+  float max;
+  float step;
+  const char* unit;
+};
+
+ParamRange capacityRange = {10.0, 1000.0, 1.0, "kWh"};
+ParamRange chargeLimitRange = {0.1, 50.0, 0.1, "kW"};
+ParamRange dischargeLimitRange = {0.1, 50.0, 0.1, "kW"};
 
 // Color definitions
-#define COLOR_BG 0x0000
-#define COLOR_BATTERY 0x07FF    
-#define COLOR_TEXT 0xFFFF
-#define COLOR_SELECTED 0xFFFF
-#define COLOR_EDITING 0x39E7
-#define COLOR_PV 0xFFE0
+#define COLOR_BG 0x0000         // Black
+#define COLOR_PRIMARY 0x07FF    // Cyan
+#define COLOR_TEXT 0xFFFF       // White
+#define COLOR_ACCENT 0xFFE0     // Yellow
+#define COLOR_PROGRESS 0x07E0   // Green
+#define COLOR_WARNING 0xF800    // Red
+#define COLOR_GRAY 0x7BEF       // Gray
+#define COLOR_DARK_GRAY 0x4208  // Dark Gray
 
 // WiFi and MQTT settings - 根據 API spec
 const char* ssid = "";
 const char* password = "";
-const char* mqtt_server = "";
-const int mqtt_port = ;      
+const char* mqtt_server = "";        // API spec endpoint
+const int mqtt_port = 8884;                             // TLS port
 
 // MQTT credentials from API spec
 const char* mqtt_username = "";
 const char* mqtt_password = "";
 
-// Device ID - 使用完整MAC address作為唯一ID
+// Device ID
 String DEVICE_ID = "";
 String CLIENT_ID = "";  
 String publish_topic = "";
@@ -88,8 +107,14 @@ String subscribe_topic = "";
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
-unsigned long lastPublishTime = 0;
 unsigned long lastReconnectAttempt = 0;
+
+// Function declarations
+void drawProgressRing(float progress, uint16_t color);
+void drawPageIndicators();
+void drawEditPage(const char* title, float value, const char* unit, ParamRange range);
+void drawServerDataPage();
+void refreshServerData();
 
 void setup_wifi() {
   delay(10);
@@ -102,7 +127,7 @@ void setup_wifi() {
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
-    M5Dial.Display.drawString(".", 120 + attempts * 5, 140);
+    M5Dial.Display.fillCircle(60 + attempts * 5, 160, 2, COLOR_PRIMARY);
     attempts++;
   }
   
@@ -110,6 +135,7 @@ void setup_wifi() {
     M5Dial.Display.fillScreen(COLOR_BG);
     M5Dial.Display.drawString("WiFi Connected!", 120, 100);
     
+    // Generate device ID from MAC address
     uint8_t mac[6];
     WiFi.macAddress(mac);
     
@@ -122,9 +148,7 @@ void setup_wifi() {
     DEVICE_ID = String(shortMacStr);
 
     CLIENT_ID = "M5Dial-" + String(macStr);
-
     publish_topic = "dial.battery." + DEVICE_ID;
-
     subscribe_topic = "dial.battery.response." + DEVICE_ID;
     
     M5Dial.Display.drawString("ID: " + DEVICE_ID, 120, 130);
@@ -161,20 +185,25 @@ void callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // 從服務器接收數據 - 根據 API spec properties-from-server
+  // Receive data from server
   bool dataChanged = false;
   
   if (doc.containsKey("soc")) {
     batterySOC = doc["soc"];
     dataChanged = true;
+    hasServerData = true;
   }
   if (doc.containsKey("power")) {
     batteryActualPower = doc["power"];
     dataChanged = true;
+    hasServerData = true;
   }
   
   if (dataChanged) {
-    drawBatteryPage();
+    lastRefreshTime = millis();
+    if (currentPage == PAGE_SERVER_DATA) {
+      drawServerDataPage();
+    }
   }
 }
 
@@ -183,19 +212,12 @@ bool reconnect() {
   M5Dial.Display.setTextSize(1.2);
   M5Dial.Display.drawString("Connecting MQTT...", 120, 60);
   M5Dial.Display.drawString(mqtt_server, 120, 85);
-  M5Dial.Display.drawString("Port: " + String(mqtt_port), 120, 110);
   
   Serial.println("\n=== MQTT Connection Attempt ===");
   Serial.print("Server: ");
   Serial.print(mqtt_server);
   Serial.print(":");
   Serial.println(mqtt_port);
-  Serial.print("Username: ");
-  Serial.println(mqtt_username);
-  Serial.print("Client ID: ");
-  Serial.println(CLIENT_ID);
-  Serial.print("Publish Topic: ");
-  Serial.println(publish_topic);
   
   bool connected = client.connect(CLIENT_ID.c_str(), mqtt_username, mqtt_password);
   
@@ -205,52 +227,22 @@ bool reconnect() {
     M5Dial.Display.fillScreen(COLOR_BG);
     M5Dial.Display.setTextSize(1.5);
     M5Dial.Display.drawString("MQTT Connected!", 120, 100);
-    M5Dial.Display.drawString("ID: " + DEVICE_ID, 120, 130);
-    delay(1500);
+    delay(1000);
     
-    publishSettings();
+    // Subscribe to response topic
+    client.subscribe(subscribe_topic.c_str());
+    
+    // Request initial data
+    refreshServerData();
+    
     return true;
-    
   } else {
     int state = client.state();
     Serial.print("MQTT Connection Failed! State: ");
     Serial.println(state);
     
     M5Dial.Display.fillScreen(COLOR_BG);
-    M5Dial.Display.setTextSize(1.2);
     M5Dial.Display.drawString("MQTT Failed!", 120, 60);
-
-    String errorMsg = "Error: ";
-    switch(state) {
-      case -4: errorMsg += "Timeout"; break;
-      case -3: errorMsg += "Lost"; break;
-      case -2: errorMsg += "Failed"; break;
-      case -1: errorMsg += "Disconnected"; break;
-      case 1: errorMsg += "Bad Protocol"; break;
-      case 2: errorMsg += "Bad ClientID"; break;
-      case 3: errorMsg += "Unavailable"; break;
-      case 4: 
-        errorMsg += "Bad Credentials"; 
-        Serial.println("! Check username/password");
-        break;
-      case 5: 
-        errorMsg += "Unauthorized";
-        Serial.println("! Authorization failed");
-        Serial.println("! Possible reasons:");
-        Serial.println("  1. Wrong password");
-        Serial.println("  2. User not authorized for this topic");
-        Serial.println("  3. ACL restrictions on server");
-        Serial.println("  4. Client ID already in use");
-        break;
-      default: errorMsg += String(state); break;
-    }
-    
-    M5Dial.Display.drawString(errorMsg, 120, 90);
-    M5Dial.Display.drawString("Check credentials", 120, 120);
-
-    M5Dial.Display.setTextSize(1.0);
-    M5Dial.Display.drawString("User: " + String(mqtt_username), 120, 150);
-    M5Dial.Display.drawString("ID: " + DEVICE_ID, 120, 170);
     
     return false;
   }
@@ -265,45 +257,39 @@ void setup() {
 
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\n=== M5Dial Battery Controller ===");
-  Serial.println("Version: 1.2 (API Spec Compliant + TLS Verified)");
-  Serial.println("API Endpoint");
+  Serial.println("\n\n=== M5Dial Battery Controller v2.0 ===");
+  Serial.println("Page-based UI with circular progress");
   
   setup_wifi();
 
   espClient.setCACert(root_ca);
-
   espClient.setTimeout(15);
   
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   client.setBufferSize(512);
-  client.setKeepAlive(60);  
+  client.setKeepAlive(60);
 
   if (!reconnect()) {
-    M5Dial.Display.fillScreen(COLOR_BG);
-    M5Dial.Display.setTextSize(1.2);
-    M5Dial.Display.drawString("Cannot connect", 120, 100);
-    M5Dial.Display.drawString("to MQTT server", 120, 125);
-    M5Dial.Display.drawString("Check Serial Monitor", 120, 150);
     delay(5000);
   }
   
-  drawBatteryPage();
+  // Draw initial page
+  drawCurrentPage();
+  oldPosition = M5Dial.Encoder.read();
 }
 
 void loop() {
+  // Check WiFi connection
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected! Reconnecting...");
-    M5Dial.Display.fillScreen(COLOR_BG);
-    M5Dial.Display.drawString("WiFi Lost!", 120, 120);
-    delay(1000);
     setup_wifi();
   }
 
+  // Check MQTT connection
   if (!client.connected()) {
     unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {  // 每5秒重試一次
+    if (now - lastReconnectAttempt > 5000) {
       lastReconnectAttempt = now;
       if (reconnect()) {
         lastReconnectAttempt = 0;
@@ -315,46 +301,322 @@ void loop() {
   
   M5Dial.update();
   
+  // Handle encoder rotation
   long newPosition = M5Dial.Encoder.read();
   
   if (newPosition != oldPosition) {
     if (isEditing) {
-      int delta = newPosition - oldPosition;
+      // In editing mode - adjust value
+      handleValueAdjustment(newPosition - oldPosition);
       oldPosition = newPosition;
-      adjustValue(delta);
-      drawBatteryPage();
     } else {
-      int newIndex = (newPosition / 4) % BATTERY_SETTING_COUNT;
-      int oldIndex = (oldPosition / 4) % BATTERY_SETTING_COUNT;
-      if (newIndex != oldIndex) {
-        currentSettingIndex = ((newIndex % BATTERY_SETTING_COUNT + BATTERY_SETTING_COUNT) % BATTERY_SETTING_COUNT);
+      // Not editing - navigate between pages
+      int delta = (newPosition - oldPosition) / 4;
+      if (delta != 0) {
+        currentPage = (currentPage + delta + PAGE_COUNT) % PAGE_COUNT;
         oldPosition = newPosition;
-        drawBatteryPage();
+        drawCurrentPage();
       }
     }
   }
   
+  // Handle button press with debounce
   if (M5Dial.BtnA.wasPressed()) {
-    if (isEditing && currentSettingIndex != BATTERY_CONFIRM) {
-
-      isEditing = false;
-      publishSettings();
-      drawBatteryPage();
-    } else if (currentSettingIndex == BATTERY_CONFIRM) {
-
-      publishSettings();
-      M5Dial.Display.fillScreen(COLOR_BG);
-      M5Dial.Display.drawString("Settings Sent!", 120, 120);
-      delay(1000);
-      drawBatteryPage();
-    } else {
-
-      isEditing = true;
-      drawBatteryPage();
+    unsigned long now = millis();
+    if (now - lastButtonPress > 200) {  // 200ms debounce
+      lastButtonPress = now;
+      handleButtonPress();
     }
   }
   
   delay(10);
+}
+
+void drawCurrentPage() {
+  switch (currentPage) {
+    case PAGE_CAPACITY:
+      drawEditPage("Battery Capacity", batteryCapacity, capacityRange.unit, capacityRange);
+      break;
+    case PAGE_CHARGE_LIMIT:
+      drawEditPage("Charge Limit", batteryChargeLimit, chargeLimitRange.unit, chargeLimitRange);
+      break;
+    case PAGE_DISCHARGE_LIMIT:
+      drawEditPage("Discharge Limit", batteryDischargeLimit, dischargeLimitRange.unit, dischargeLimitRange);
+      break;
+    case PAGE_SERVER_DATA:
+      drawServerDataPage();
+      break;
+  }
+}
+
+void drawEditPage(const char* title, float value, const char* unit, ParamRange range) {
+  M5Dial.Display.fillScreen(COLOR_BG);
+  
+  // Draw title at top
+  M5Dial.Display.setTextSize(1.8);
+  M5Dial.Display.setTextColor(COLOR_PRIMARY);
+  M5Dial.Display.drawString(title, 120, 40);
+  
+  // Draw large value in center
+  M5Dial.Display.setTextSize(3.5);
+  M5Dial.Display.setTextColor(isEditing ? COLOR_ACCENT : COLOR_TEXT);
+  String valueStr = String(value, (range.step < 1) ? 1 : 0);
+  M5Dial.Display.drawString(valueStr, 120, 120);
+  
+  // Draw unit
+  M5Dial.Display.setTextSize(2);
+  M5Dial.Display.setTextColor(COLOR_GRAY);
+  M5Dial.Display.drawString(unit, 120, 160);
+  
+  // Draw status/instruction
+  M5Dial.Display.setTextSize(1.2);
+  if (isEditing) {
+    M5Dial.Display.setTextColor(COLOR_ACCENT);
+    M5Dial.Display.drawString("Rotate to adjust", 120, 190);
+    M5Dial.Display.drawString("Press to save", 120, 205);
+    
+    // Draw progress ring when editing
+    float progress = (value - range.min) / (range.max - range.min);
+    drawProgressRing(progress, COLOR_PROGRESS);
+  } else {
+    M5Dial.Display.setTextColor(COLOR_GRAY);
+    M5Dial.Display.drawString("Press to edit", 120, 190);
+    M5Dial.Display.drawString("Rotate for pages", 120, 205);
+  }
+  
+  // Draw page indicators
+  drawPageIndicators();
+}
+
+void drawServerDataPage() {
+  M5Dial.Display.fillScreen(COLOR_BG);
+  
+  // Draw title
+  M5Dial.Display.setTextSize(1.8);
+  M5Dial.Display.setTextColor(COLOR_PRIMARY);
+  M5Dial.Display.drawString("Server Data", 120, 40);
+  
+  if (hasServerData) {
+    // Draw SOC with battery icon
+    drawBatteryIcon(120, 80, batterySOC);
+    
+    M5Dial.Display.setTextSize(2);
+    M5Dial.Display.setTextColor(COLOR_TEXT);
+    M5Dial.Display.drawString("SOC: " + String(batterySOC, 1) + "%", 120, 110);
+    
+    // Draw power with direction indicator
+    M5Dial.Display.setTextSize(1.5);
+    String powerText;
+    uint16_t powerColor;
+    
+    if (batteryActualPower > 0.05) {
+      powerText = "Discharging";
+      powerColor = COLOR_ACCENT;
+      // Draw discharge arrow
+      drawArrow(90, 150, true);
+    } else if (batteryActualPower < -0.05) {
+      powerText = "Charging";
+      powerColor = COLOR_PROGRESS;
+      // Draw charge arrow
+      drawArrow(90, 150, false);
+    } else {
+      powerText = "Idle";
+      powerColor = COLOR_GRAY;
+    }
+    
+    M5Dial.Display.setTextColor(powerColor);
+    M5Dial.Display.drawString(powerText, 120, 150);
+    
+    M5Dial.Display.setTextSize(2);
+    M5Dial.Display.setTextColor(COLOR_TEXT);
+    M5Dial.Display.drawString(String(abs(batteryActualPower), 1) + " kW", 120, 175);
+    
+    // Draw refresh button hint
+    M5Dial.Display.setTextSize(1);
+    M5Dial.Display.setTextColor(COLOR_GRAY);
+    M5Dial.Display.drawString("Press to refresh", 120, 205);
+    
+  } else {
+    // No data yet
+    M5Dial.Display.setTextSize(1.5);
+    M5Dial.Display.setTextColor(COLOR_GRAY);
+    M5Dial.Display.drawString("No data yet", 120, 120);
+    
+    M5Dial.Display.setTextSize(1.2);
+    M5Dial.Display.drawString("Press to refresh", 120, 160);
+  }
+  
+  // Draw page indicators
+  drawPageIndicators();
+  
+  // Draw connection status
+  drawConnectionStatus();
+}
+
+void drawProgressRing(float progress, uint16_t color) {
+  int centerX = 120;
+  int centerY = 120;
+  int radius = 110;
+  int thickness = 8;
+  
+  // Draw background ring
+  for (int angle = 0; angle < 360; angle += 2) {
+    float rad = angle * PI / 180;
+    int x1 = centerX + (radius - thickness) * cos(rad);
+    int y1 = centerY + (radius - thickness) * sin(rad);
+    int x2 = centerX + radius * cos(rad);
+    int y2 = centerY + radius * sin(rad);
+    M5Dial.Display.drawLine(x1, y1, x2, y2, COLOR_DARK_GRAY);
+  }
+  
+  // Draw progress
+  int endAngle = -90 + (progress * 360);
+  for (int angle = -90; angle < endAngle; angle += 2) {
+    float rad = angle * PI / 180;
+    int x1 = centerX + (radius - thickness) * cos(rad);
+    int y1 = centerY + (radius - thickness) * sin(rad);
+    int x2 = centerX + radius * cos(rad);
+    int y2 = centerY + radius * sin(rad);
+    M5Dial.Display.drawLine(x1, y1, x2, y2, color);
+  }
+}
+
+void drawPageIndicators() {
+  int y = 230;
+  int spacing = 15;
+  int startX = 120 - ((PAGE_COUNT - 1) * spacing / 2);
+  
+  for (int i = 0; i < PAGE_COUNT; i++) {
+    int x = startX + i * spacing;
+    if (i == currentPage) {
+      M5Dial.Display.fillCircle(x, y, 4, COLOR_PRIMARY);
+    } else {
+      M5Dial.Display.drawCircle(x, y, 3, COLOR_GRAY);
+    }
+  }
+}
+
+void drawBatteryIcon(int x, int y, float soc) {
+  int width = 40;
+  int height = 20;
+  
+  // Draw battery outline
+  M5Dial.Display.drawRect(x - width/2, y - height/2, width, height, COLOR_TEXT);
+  M5Dial.Display.fillRect(x + width/2, y - 3, 3, 6, COLOR_TEXT);
+  
+  // Fill based on SOC
+  int fillWidth = (width - 4) * soc / 100;
+  uint16_t fillColor = COLOR_PROGRESS;
+  if (soc < 20) fillColor = COLOR_WARNING;
+  else if (soc < 50) fillColor = COLOR_ACCENT;
+  
+  M5Dial.Display.fillRect(x - width/2 + 2, y - height/2 + 2, 
+                          fillWidth, height - 4, fillColor);
+}
+
+void drawArrow(int x, int y, bool right) {
+  if (right) {
+    // Right arrow (discharge)
+    M5Dial.Display.drawLine(x, y, x + 20, y, COLOR_ACCENT);
+    M5Dial.Display.drawLine(x + 20, y, x + 15, y - 5, COLOR_ACCENT);
+    M5Dial.Display.drawLine(x + 20, y, x + 15, y + 5, COLOR_ACCENT);
+  } else {
+    // Left arrow (charge)
+    M5Dial.Display.drawLine(x + 20, y, x, y, COLOR_PROGRESS);
+    M5Dial.Display.drawLine(x, y, x + 5, y - 5, COLOR_PROGRESS);
+    M5Dial.Display.drawLine(x, y, x + 5, y + 5, COLOR_PROGRESS);
+  }
+}
+
+void drawConnectionStatus() {
+  int y = 10;
+  M5Dial.Display.setTextSize(0.8);
+  
+  if (client.connected()) {
+    M5Dial.Display.setTextColor(COLOR_PROGRESS);
+    M5Dial.Display.drawString("Connected", 120, y);
+  } else {
+    M5Dial.Display.setTextColor(COLOR_WARNING);
+    M5Dial.Display.drawString("Offline", 120, y);
+  }
+}
+
+void handleButtonPress() {
+  if (currentPage == PAGE_SERVER_DATA) {
+    // On server data page (last page) - refresh data
+    refreshServerData();
+    
+    // Show refresh animation
+    M5Dial.Display.fillCircle(120, 120, 20, COLOR_PRIMARY);
+    M5Dial.Display.setTextColor(COLOR_BG);
+    M5Dial.Display.setTextSize(1.2);
+    M5Dial.Display.drawString("Refresh", 120, 120);
+    delay(300);
+    
+    drawCurrentPage();
+  } else {
+    // On setting pages (first 3 pages) - toggle edit mode
+    if (isEditing) {
+      // Save and exit edit mode
+      isEditing = false;
+      publishSettings();
+      
+      // Show confirmation
+      M5Dial.Display.fillRect(0, 100, 240, 40, COLOR_PROGRESS);
+      M5Dial.Display.setTextColor(COLOR_BG);
+      M5Dial.Display.setTextSize(1.5);
+      M5Dial.Display.drawString("Saved!", 120, 120);
+      delay(500);
+      
+      drawCurrentPage();
+    } else {
+      // Enter edit mode
+      isEditing = true;
+      
+      // Store starting value
+      switch (currentPage) {
+        case PAGE_CAPACITY:
+          editStartValue = batteryCapacity;
+          break;
+        case PAGE_CHARGE_LIMIT:
+          editStartValue = batteryChargeLimit;
+          break;
+        case PAGE_DISCHARGE_LIMIT:
+          editStartValue = batteryDischargeLimit;
+          break;
+      }
+      
+      drawCurrentPage();
+    }
+  }
+}
+
+void handleValueAdjustment(int delta) {
+  float* valuePtr = nullptr;
+  ParamRange* rangePtr = nullptr;
+  
+  switch (currentPage) {
+    case PAGE_CAPACITY:
+      valuePtr = &batteryCapacity;
+      rangePtr = &capacityRange;
+      break;
+    case PAGE_CHARGE_LIMIT:
+      valuePtr = &batteryChargeLimit;
+      rangePtr = &chargeLimitRange;
+      break;
+    case PAGE_DISCHARGE_LIMIT:
+      valuePtr = &batteryDischargeLimit;
+      rangePtr = &dischargeLimitRange;
+      break;
+    default:
+      return;
+  }
+  
+  if (valuePtr && rangePtr) {
+    *valuePtr += delta * rangePtr->step;
+    *valuePtr = constrain(*valuePtr, rangePtr->min, rangePtr->max);
+    drawCurrentPage();
+  }
 }
 
 void publishSettings() {
@@ -364,107 +626,37 @@ void publishSettings() {
   }
   
   StaticJsonDocument<256> doc;
-  doc["capacity"] = batteryCapacity;           // kWh (required)
-  doc["chargeLimit"] = batteryChargeLimit;     // kW (required)
-  doc["dischargeLimit"] = batteryDischargeLimit; // kW (required)
+  doc["capacity"] = batteryCapacity;
+  doc["chargeLimit"] = batteryChargeLimit;
+  doc["dischargeLimit"] = batteryDischargeLimit;
   
   char buffer[256];
-  size_t n = serializeJson(doc, buffer);
+  serializeJson(doc, buffer);
   
   bool success = client.publish(publish_topic.c_str(), buffer, false);
   
   if (success) {
-    Serial.println("[PUBLISH] Success");
+    Serial.println("[PUBLISH] Settings sent successfully");
     Serial.print("  Topic: ");
     Serial.println(publish_topic);
     Serial.print("  Payload: ");
     Serial.println(buffer);
   } else {
-    Serial.println("[PUBLISH] ✗ Failed!");
+    Serial.println("[PUBLISH] Failed to send settings");
   }
 }
 
-void adjustValue(int delta) {
-  float increment = 0.1;
-  switch (currentSettingIndex) {
-    case BATTERY_CAPACITY:
-      batteryCapacity += delta * increment * 10; // 1 kWh step
-      batteryCapacity = constrain(batteryCapacity, 10.0, 1000.0);
-      break;
-    case BATTERY_CHARGE_LIMIT:
-      batteryChargeLimit += delta * increment; // 0.1 kW step
-      batteryChargeLimit = constrain(batteryChargeLimit, 0.1, 50.0);
-      break;
-    case BATTERY_DISCHARGE_LIMIT:
-      batteryDischargeLimit += delta * increment; // 0.1 kW step
-      batteryDischargeLimit = constrain(batteryDischargeLimit, 0.1, 50.0);
-      break;
+void refreshServerData() {
+  // Send empty message to request data
+  if (client.connected()) {
+    StaticJsonDocument<64> doc;
+    doc["request"] = "status";
+    
+    char buffer[64];
+    serializeJson(doc, buffer);
+    
+    client.publish(publish_topic.c_str(), buffer, false);
+    
+    Serial.println("[REQUEST] Requesting server data");
   }
-}
-
-void drawBatteryPage() {
-  M5Dial.Display.fillScreen(COLOR_BG);
-  M5Dial.Display.fillRect(0, 0, 240, 40, COLOR_BATTERY);
-  M5Dial.Display.setTextColor(COLOR_BG);
-  M5Dial.Display.setTextSize(1.5);
-  M5Dial.Display.drawString("Battery Settings", 120, 20);
-  
-  M5Dial.Display.setTextColor(COLOR_TEXT);
-  
-  int yStart = 60;
-  int ySpacing = 30;
-  drawSettingItem("Capacity (kWh)", String(batteryCapacity, 1), yStart, 
-                  currentSettingIndex == BATTERY_CAPACITY, isEditing);
-  drawSettingItem("Charge (kW)", String(batteryChargeLimit, 1), 
-                  yStart + ySpacing, currentSettingIndex == BATTERY_CHARGE_LIMIT, isEditing);
-  drawSettingItem("Discharge (kW)", String(batteryDischargeLimit, 1), 
-                  yStart + ySpacing * 2, currentSettingIndex == BATTERY_DISCHARGE_LIMIT, isEditing);
-  
-  M5Dial.Display.setTextColor(COLOR_TEXT);
-  M5Dial.Display.setTextSize(1.5);
-  M5Dial.Display.drawString("SOC: " + String(batterySOC, 1) + "%", 120, yStart + ySpacing * 3);
-  
-  String powerText;
-  if (batteryActualPower > 0.05) {
-    powerText = "Discharge: " + String(batteryActualPower, 1) + "kW";
-  } else if (batteryActualPower < -0.05) {
-    powerText = "Charge: " + String(-batteryActualPower, 1) + "kW";
-  } else {
-    powerText = "Idle: 0.0kW";
-  }
-  M5Dial.Display.drawString(powerText, 120, yStart + ySpacing * 4);
-
-  M5Dial.Display.setTextColor(currentSettingIndex == BATTERY_CONFIRM ? COLOR_BATTERY : COLOR_TEXT);
-  M5Dial.Display.drawString("Send Now", 120, yStart + ySpacing * 5);
-  
-
-  M5Dial.Display.setTextSize(1.0);
-  String statusText = "ID:" + DEVICE_ID;
-  if (!client.connected()) {
-    statusText += " [OFFLINE]";
-    M5Dial.Display.setTextColor(0xF800);
-  } else {
-    M5Dial.Display.setTextColor(0x07E0);
-  }
-  M5Dial.Display.drawString(statusText, 120, 230);
-}
-
-void drawSettingItem(const char* label, String value, int y, bool selected, bool editing) {
-  uint16_t textColor = COLOR_TEXT;
-  uint16_t valueColor = COLOR_TEXT;
-  
-  if (selected) {
-    if (editing) {
-      M5Dial.Display.fillRect(10, y - 12, 220, 24, COLOR_EDITING);
-      valueColor = COLOR_PV;
-    } else {
-      textColor = valueColor = COLOR_BATTERY;
-    }
-  }
-  
-  M5Dial.Display.setTextColor(textColor);
-  M5Dial.Display.setTextSize(1.5);
-  M5Dial.Display.drawString(label, 70, y);
-  M5Dial.Display.setTextColor(valueColor);
-  M5Dial.Display.drawString(value, 180, y);
 }
