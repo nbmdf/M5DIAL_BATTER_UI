@@ -259,7 +259,12 @@ void setup() {
   delay(1000);
   Serial.println("\n\n=== M5Dial Battery Controller v2.0 ===");
   Serial.println("Page-based UI with circular progress");
-  
+
+  currentPage = PAGE_CAPACITY;
+  isEditing   = false;
+  M5Dial.Encoder.write(0);   // 把編碼器計數歸 0
+  oldPosition = 0;           // 同步舊位置
+
   setup_wifi();
 
   espClient.setCACert(root_ca);
@@ -276,7 +281,6 @@ void setup() {
   
   // Draw initial page
   drawCurrentPage();
-  oldPosition = M5Dial.Encoder.read();
 }
 
 void loop() {
